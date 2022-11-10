@@ -2,13 +2,15 @@
 // Licensed under the MIT license.
 
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use tonic::{async_trait, Request, Response, Status};
 use url::Url;
 
 use crate::intent_broker::IntentBroker;
 use crate::registry::{
-    ExecutionLocality, IntentConfiguration, IntentKind, Registry, ServiceConfiguration, ServiceId,
+    ExecutionLocality, IntentConfiguration, IntentKind, Observer, Registry, ServiceConfiguration,
+    ServiceId,
 };
 use chariott_common::proto::*;
 use chariott_common::proto::{runtime as runtime_api, runtime::IntentRegistration};
@@ -25,20 +27,25 @@ const INTENT_MAPPING_WRITE: i32 = 3;
 const INTENT_MAPPING_INVOKE: i32 = 4;
 const INTENT_MAPPING_SUBSCRIBE: i32 = 5;
 
-pub struct ChariottServer {
+pub struct ChariottServer<T: Observer> {
     broker: IntentBroker,
-    registry: Arc<RwLock<Registry<IntentBroker>>>,
+    registry: Arc<RwLock<Registry<T>>>,
 }
 
-impl ChariottServer {
-    pub fn new(registry: Registry<IntentBroker>, broker: IntentBroker) -> Self {
+impl<T: Observer> ChariottServer<T> {
+    pub fn new(registry: Registry<T>, broker: IntentBroker) -> Self {
         Self { registry: Arc::new(RwLock::new(registry)), broker }
+    }
+
+    pub fn registry_do<U>(&self, f: impl FnOnce(&mut Registry<T>) -> U) -> U {
+        let mut registry = self.registry.write().unwrap();
+        f(&mut registry)
     }
 
     fn create_configruation_from_registration(
         intent: IntentRegistration,
     ) -> Result<IntentConfiguration, Status> {
-        ChariottServer::map_intent_value(intent.intent)
+        ChariottServer::<T>::map_intent_value(intent.intent)
             .map(|kind| IntentConfiguration::new(intent.namespace, kind))
     }
 
@@ -67,7 +74,9 @@ impl ChariottServer {
 }
 
 #[async_trait]
-impl runtime_api::chariott_service_server::ChariottService for ChariottServer {
+impl<T: Observer + Send + Sync + 'static> runtime_api::chariott_service_server::ChariottService
+    for ChariottServer<T>
+{
     async fn announce(
         &self,
         request: Request<runtime_api::AnnounceRequest>,
@@ -77,7 +86,7 @@ impl runtime_api::chariott_service_server::ChariottService for ChariottServer {
             .service
             .ok_or_else(|| Status::new(tonic::Code::InvalidArgument, "service is required"))?;
         let svc_cfg = resolve_service_configuration(service)?;
-        let registration_state = if self.registry.read().unwrap().has_service(&svc_cfg) {
+        let registration_state = if self.registry.write().unwrap().touch(&svc_cfg, Instant::now()) {
             tracing::debug!("Service {:#?} already announced", svc_cfg);
             runtime_api::RegistrationState::NotChanged
         } else {
@@ -101,12 +110,12 @@ impl runtime_api::chariott_service_server::ChariottService for ChariottServer {
         let intents: Result<Vec<_>, _> = request
             .intents
             .into_iter()
-            .map(ChariottServer::create_configruation_from_registration)
+            .map(ChariottServer::<T>::create_configruation_from_registration)
             .collect();
         self.registry
             .write()
             .unwrap()
-            .upsert(svc_cfg, intents?)
+            .upsert(svc_cfg, intents?, Instant::now())
             .map_err(|e| Status::unknown(e.message()))?;
         Ok(Response::new(runtime_api::RegisterResponse {}))
     }
@@ -122,7 +131,7 @@ impl runtime_api::chariott_service_server::ChariottService for ChariottServer {
         let config = IntentConfiguration::new(
             request.namespace,
             match intent.intent {
-                Some(ref intent) => Ok(ChariottServer::map_intent_variant(intent)),
+                Some(ref intent) => Ok(ChariottServer::<T>::map_intent_variant(intent)),
                 None => Err(Status::invalid_argument("Intent is not known.")),
             }?,
         );
@@ -172,7 +181,8 @@ fn map_locality_value(locality: i32) -> Result<ExecutionLocality, Status> {
 #[cfg(test)]
 mod tests {
     use crate::execution::RuntimeBinding;
-    use crate::registry::{Registry, RegistryObserver};
+    use crate::registry::{Change, Observer, Registry};
+    use crate::streaming::StreamingEss;
     use crate::{connection_provider::GrpcProvider, execution::tests::TestBinding};
     use chariott_common::proto::{
         common, runtime as runtime_api,
@@ -245,7 +255,7 @@ mod tests {
 
     #[test]
     fn intent_match_failure_are_caught() {
-        assert!(ChariottServer::map_intent_value(-1).is_err());
+        assert!(ChariottServer::<IntentBroker>::map_intent_value(-1).is_err());
     }
 
     #[test]
@@ -264,35 +274,19 @@ mod tests {
             IntentKind::Subscribe => {}
         }
 
-        assert_eq!(
-            ChariottServer::map_intent_value(INTENT_MAPPING_DISCOVER).unwrap(),
-            IntentKind::Discover
-        );
+        fn test(intent_value: i32, kind: IntentKind) {
+            assert_eq!(
+                ChariottServer::<IntentBroker>::map_intent_value(intent_value).unwrap(),
+                kind
+            );
+        }
 
-        assert_eq!(
-            ChariottServer::map_intent_value(INTENT_MAPPING_INSPECT).unwrap(),
-            IntentKind::Inspect
-        );
-
-        assert_eq!(
-            ChariottServer::map_intent_value(INTENT_MAPPING_READ).unwrap(),
-            IntentKind::Read
-        );
-
-        assert_eq!(
-            ChariottServer::map_intent_value(INTENT_MAPPING_WRITE).unwrap(),
-            IntentKind::Write
-        );
-
-        assert_eq!(
-            ChariottServer::map_intent_value(INTENT_MAPPING_INVOKE).unwrap(),
-            IntentKind::Invoke
-        );
-
-        assert_eq!(
-            ChariottServer::map_intent_value(INTENT_MAPPING_SUBSCRIBE).unwrap(),
-            IntentKind::Subscribe
-        );
+        test(INTENT_MAPPING_DISCOVER, IntentKind::Discover);
+        test(INTENT_MAPPING_INSPECT, IntentKind::Inspect);
+        test(INTENT_MAPPING_READ, IntentKind::Read);
+        test(INTENT_MAPPING_WRITE, IntentKind::Write);
+        test(INTENT_MAPPING_INVOKE, IntentKind::Invoke);
+        test(INTENT_MAPPING_SUBSCRIBE, IntentKind::Subscribe);
     }
 
     #[test]
@@ -404,7 +398,7 @@ mod tests {
                 IntentKind::Subscribe,
             ),
         ] {
-            assert_eq!(expected, ChariottServer::map_intent_variant(&intent));
+            assert_eq!(expected, ChariottServer::<IntentBroker>::map_intent_variant(&intent));
         }
     }
 
@@ -421,12 +415,8 @@ mod tests {
         }
     }
 
-    impl RegistryObserver for MockBroker {
-        fn on_intent_config_change<'a>(
-            &self,
-            _: IntentConfiguration,
-            _: impl IntoIterator<Item = &'a ServiceConfiguration>,
-        ) {
+    impl Observer for MockBroker {
+        fn on_change<'a>(&self, _: impl IntoIterator<Item = Change<'a>>) {
             todo!()
         }
     }
@@ -440,9 +430,10 @@ mod tests {
         }
     }
 
-    fn setup() -> ChariottServer {
-        let broker = IntentBroker::new();
-        ChariottServer::new(Registry::new(broker.clone()), broker)
+    fn setup() -> ChariottServer<IntentBroker> {
+        let broker =
+            IntentBroker::new("https://localhost:4243".parse().unwrap(), StreamingEss::new());
+        ChariottServer::new(Registry::new(broker.clone(), Default::default()), broker)
     }
 
     fn create_announce_request() -> AnnounceRequest {

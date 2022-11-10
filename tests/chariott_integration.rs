@@ -2,11 +2,13 @@
 // Licensed under the MIT license.
 
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use chariott::registry::{
     ExecutionLocality, IntentConfiguration, IntentKind, ServiceConfiguration, ServiceId,
 };
+use chariott::streaming::StreamingEss;
 use chariott::{chariott_grpc::ChariottServer, registry::Registry, IntentBroker};
 use chariott_common::error::{Error, ResultExt as _};
 use chariott_common::proto::common::{intent::Intent as InnerIntent, Intent};
@@ -17,7 +19,6 @@ use common::get_uuid;
 use examples_common::chariott::{
     api::{Chariott, ChariottCommunication},
     proto::streaming::channel_service_server::ChannelServiceServer,
-    streaming::StreamingStore,
     value::Value,
 };
 use provider::Provider;
@@ -117,7 +118,7 @@ async fn when_cancelled_shuts_down_provider() -> anyhow::Result<()> {
     let cancellation_token = CancellationToken::new();
     let handle = spawn(
         Server::builder()
-            .add_service(ChannelServiceServer::new(StreamingStore::<Value>::new()))
+            .add_service(ChannelServiceServer::new(StreamingEss::new()))
             .serve_with_cancellation(
                 format!("0.0.0.0:{}", get_port()).parse().unwrap(),
                 cancellation_token.child_token(),
@@ -135,7 +136,7 @@ async fn when_cancelled_shuts_down_provider() -> anyhow::Result<()> {
 
 struct Subject {
     namespace: String,
-    subject: ChariottServer,
+    subject: ChariottServer<IntentBroker>,
 }
 
 struct ProviderSetup {
@@ -161,8 +162,8 @@ async fn setup(provider: Provider) -> Subject {
 
 async fn setup_multiple(providers: impl IntoIterator<Item = ProviderSetup>) -> Subject {
     let namespace = "sdv.integration".to_owned();
-    let broker = IntentBroker::new();
-    let mut registry = Registry::new(broker.clone());
+    let broker = IntentBroker::new("https://localhost:4243".parse().unwrap(), StreamingEss::new());
+    let mut registry = Registry::new(broker.clone(), Default::default());
 
     for ProviderSetup { provider, port, name, locality } in providers {
         let url = provider.serve(port).await;
@@ -171,6 +172,7 @@ async fn setup_multiple(providers: impl IntoIterator<Item = ProviderSetup>) -> S
             .upsert(
                 ServiceConfiguration::new(ServiceId::new(name, "1.0.0"), url, locality),
                 vec![IntentConfiguration::new(namespace.clone(), IntentKind::Invoke)],
+                Instant::now(),
             )
             .unwrap();
     }

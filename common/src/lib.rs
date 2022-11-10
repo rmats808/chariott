@@ -19,8 +19,14 @@
 /// Generic error handling
 pub mod error;
 
-// Configuration related utilites
+/// Extension traits
+pub mod ext;
+
+/// Configuration related utilites
 pub mod config;
+
+/// Integration of the event sub-system with the gRPC streaming contract.
+pub mod streaming_ess;
 
 /// Protobuf generated files.
 pub mod proto;
@@ -31,5 +37,5 @@ pub mod query;
 /// Graceful shutdown helpers
 pub mod shutdown;
 
-// Tokio utilities
+/// Tokio utilities
 pub mod tokio_runtime_fork;
