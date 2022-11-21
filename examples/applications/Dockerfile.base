@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT license.
 
-ARG RUST_VERSION=1.64
+ARG RUST_VERSION=1.65
 FROM rust:${RUST_VERSION} AS builder
 
 # Dockerfile for building Chariott base image
@@ -45,7 +45,7 @@ ENV OPENSSL_DIR /musl
 
 WORKDIR /sdv
 
-COPY ./rust-toolchain .
+COPY ./rust-toolchain.toml .
 
 RUN rustup target add x86_64-unknown-linux-musl
 
